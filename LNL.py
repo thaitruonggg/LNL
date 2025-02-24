@@ -2,6 +2,7 @@
 Author: Omid Nejati
 Email: omid_nejaty@alumni.iust.ac.ir
 LNL : Introducing locality mechanism into Transformer in Transformer (TNT)
+New
 """
 import torch
 import torch.nn as nn
