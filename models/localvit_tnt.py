@@ -14,7 +14,7 @@ from timm.models.layers import DropPath, trunc_normal_
 from timm.models.vision_transformer import Mlp
 from timm.models.registry import register_model
 from models.localvit import LocalityFeedForward
-from models.tnt import Attention, TNT
+from models.tnt import MCAAttention, TNT
 import math
 
 
