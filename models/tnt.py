@@ -263,7 +263,7 @@ class PixelEmbed(nn.Module):
         return x
 
 
-class TNT_MCA(nn.Module):
+class TNT(nn.Module):
     """ Transformer in Transformer with MCA Cross-Attention
     """
 
