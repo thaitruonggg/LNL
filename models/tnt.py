@@ -353,8 +353,8 @@ class TNT(nn.Module):
 
 
 @register_model
-def tnt_mca_t_patch16_224(pretrained=False, **kwargs):
-    model = TNT_MCA(patch_size=16, embed_dim=192, in_dim=12, depth=12, num_heads=3, in_num_head=3,
+def tnt_t_patch16_224(pretrained=False, **kwargs):
+    model = TNT(patch_size=16, embed_dim=192, in_dim=12, depth=12, num_heads=3, in_num_head=3,
                     qkv_bias=False, **kwargs)
     model.default_cfg = default_cfgs['tnt_t_patch16_224']
     if pretrained:
@@ -364,8 +364,8 @@ def tnt_mca_t_patch16_224(pretrained=False, **kwargs):
 
 
 @register_model
-def tnt_mca_s_patch16_224(pretrained=False, **kwargs):
-    model = TNT_MCA(patch_size=16, embed_dim=384, in_dim=24, depth=12, num_heads=6, in_num_head=4,
+def tnt_s_patch16_224(pretrained=False, **kwargs):
+    model = TNT(patch_size=16, embed_dim=384, in_dim=24, depth=12, num_heads=6, in_num_head=4,
                     qkv_bias=False, **kwargs)
     model.default_cfg = default_cfgs['tnt_s_patch16_224']
     if pretrained:
@@ -375,8 +375,8 @@ def tnt_mca_s_patch16_224(pretrained=False, **kwargs):
 
 
 @register_model
-def tnt_mca_b_patch16_224(pretrained=False, **kwargs):
-    model = TNT_MCA(patch_size=16, embed_dim=640, in_dim=40, depth=12, num_heads=10, in_num_head=4,
+def tnt_b_patch16_224(pretrained=False, **kwargs):
+    model = TNT(patch_size=16, embed_dim=640, in_dim=40, depth=12, num_heads=10, in_num_head=4,
                     qkv_bias=False, **kwargs)
     model.default_cfg = default_cfgs['tnt_b_patch16_224']
     if pretrained:
