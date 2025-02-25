@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import numbers
 from mmseg.registry import MODELS
 from einops import rearrange
-from ..mm.utils.wrapper import resize
+from .mm.utils.wrapper import resize
 from mmcv.cnn import ConvModule, DepthwiseSeparableConvModule
 from mmseg.models.decode_heads.decode_head import BaseDecodeHead
 
