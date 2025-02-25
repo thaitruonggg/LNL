@@ -1,13 +1,13 @@
-from . import deit
-from . import tnt
-from . import pvt
-from . import t2t_vit
-from . import localvit
-from . import localvit_tnt
-from . import localvit_pvt
-from . import localvit_t2t
-from . import swin_transformer
-from . import localvit_swin
+from models import deit
+from models import tnt
+from models import pvt
+from models import t2t_vit
+from models import localvit
+from models import localvit_tnt
+from models import localvit_pvt
+from models import localvit_t2t
+from models import swin_transformer
+from models import localvit_swin
 
 # Copyright (c) OpenMMLab. All rights reserved.
 import warnings
