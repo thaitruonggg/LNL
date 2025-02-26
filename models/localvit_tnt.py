@@ -14,7 +14,7 @@ from timm.models.layers import DropPath, trunc_normal_
 from timm.models.vision_transformer import Mlp
 from timm.models.registry import register_model
 from models.localvit import LocalityFeedForward
-from models.tnt import Attention, TNT
+from models.tnt import Attention, TNT, PixelEmbed
 import math
 
 
@@ -93,18 +93,36 @@ class Block(nn.Module):
 
 
 class LocalViT_TNT(TNT):
-    """ Transformer in Transformer - https://arxiv.org/abs/2103.00112
+    """ Transformer in Transformer with local attention - based on https://arxiv.org/abs/2103.00112
     """
 
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, in_dim=48, depth=12,
                  num_heads=12, in_num_head=4, mlp_ratio=4., qkv_bias=False, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=nn.LayerNorm, first_stride=4):
-        super().__init__(img_size, patch_size, in_chans, num_classes, embed_dim, in_dim, depth,
-                 num_heads, in_num_head, mlp_ratio, qkv_bias, drop_rate, attn_drop_rate,
-                 drop_path_rate, norm_layer, first_stride)
+        # Call the parent constructor but don't create blocks there
+        super(TNT, self).__init__()  # Call nn.Module's init instead of TNT's init
+
+        # Copy initialization code from TNT
+        self.num_classes = num_classes
+        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
+
+        self.pixel_embed = PixelEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=in_chans, in_dim=in_dim, stride=first_stride)
+        num_patches = self.pixel_embed.num_patches
+        self.num_patches = num_patches
         new_patch_size = self.pixel_embed.new_patch_size
         num_pixel = new_patch_size ** 2
 
+        self.norm1_proj = norm_layer(num_pixel * in_dim)
+        self.proj = nn.Linear(num_pixel * in_dim, embed_dim)
+        self.norm2_proj = norm_layer(embed_dim)
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.patch_pos = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.pixel_pos = nn.Parameter(torch.zeros(1, in_dim, new_patch_size, new_patch_size))
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        # Create your own blocks with the modified Block implementation
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         blocks = []
         for i in range(depth):
@@ -113,8 +131,24 @@ class LocalViT_TNT(TNT):
                 mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate, attn_drop=attn_drop_rate,
                 drop_path=dpr[i], norm_layer=norm_layer))
         self.blocks = nn.ModuleList(blocks)
+        self.norm = norm_layer(embed_dim)
 
+        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+
+        trunc_normal_(self.cls_token, std=.02)
+        trunc_normal_(self.patch_pos, std=.02)
+        trunc_normal_(self.pixel_pos, std=.02)
         self.apply(self._init_weights)
+
+    # Copy the _init_weights method from TNT
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
 
 
 @register_model

@@ -257,49 +257,49 @@ class TNT(nn.Module):
         trunc_normal_(self.pixel_pos, std=.02)
         self.apply(self._init_weights)
 
-        def _init_weights(self, m):
-            if isinstance(m, nn.Linear):
-                trunc_normal_(m.weight, std=.02)
-                if isinstance(m, nn.Linear) and m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-                nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
 
-        @torch.jit.ignore
-        def no_weight_decay(self):
-            return {'patch_pos', 'pixel_pos', 'cls_token'}
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'patch_pos', 'pixel_pos', 'cls_token'}
 
-        def get_classifier(self):
-            return self.head
+    def get_classifier(self):
+        return self.head
 
-        def reset_classifier(self, num_classes, global_pool=''):
-            self.num_classes = num_classes
-            self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+    def reset_classifier(self, num_classes, global_pool=''):
+        self.num_classes = num_classes
+        self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-        def forward_features(self, x):
-            attn_weights = []
-            B = x.shape[0]
-            pixel_embed = self.pixel_embed(x, self.pixel_pos)
+    def forward_features(self, x):
+        attn_weights = []
+        B = x.shape[0]
+        pixel_embed = self.pixel_embed(x, self.pixel_pos)
 
-            patch_embed = self.norm2_proj(self.proj(self.norm1_proj(pixel_embed.reshape(B, self.num_patches, -1))))
-            patch_embed = torch.cat((self.cls_token.expand(B, -1, -1), patch_embed), dim=1)
-            patch_embed = patch_embed + self.patch_pos
-            patch_embed = self.pos_drop(patch_embed)
+        patch_embed = self.norm2_proj(self.proj(self.norm1_proj(pixel_embed.reshape(B, self.num_patches, -1))))
+        patch_embed = torch.cat((self.cls_token.expand(B, -1, -1), patch_embed), dim=1)
+        patch_embed = patch_embed + self.patch_pos
+        patch_embed = self.pos_drop(patch_embed)
 
-            for blk in self.blocks:
-                pixel_embed, patch_embed, weights = blk(pixel_embed, patch_embed)
-                attn_weights.append(weights)
-            patch_embed = self.norm(patch_embed)
-            return patch_embed[:, 0], attn_weights
+        for blk in self.blocks:
+            pixel_embed, patch_embed, weights = blk(pixel_embed, patch_embed)
+            attn_weights.append(weights)
+        patch_embed = self.norm(patch_embed)
+        return patch_embed[:, 0], attn_weights
 
-        def forward(self, x, vis=False):
-            x, attn_weights = self.forward_features(x)
-            x = self.head(x)
-            if vis:
-                return x, attn_weights
-            else:
-                return x
+    def forward(self, x, vis=False):
+        x, attn_weights = self.forward_features(x)
+        x = self.head(x)
+        if vis:
+            return x, attn_weights
+        else:
+            return x
 
     @register_model
     def tnt_t_patch16_224(pretrained=False, **kwargs):
