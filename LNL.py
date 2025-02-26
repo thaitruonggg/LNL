@@ -50,16 +50,14 @@ class Block(nn.Module):
         super().__init__()
         # Inner transformer
         self.norm_in = norm_layer(in_dim)
+        # Fix: Remove the redundant num_heads parameter
         self.attn_in = MCAAttention(
-            in_dim, in_dim, num_heads=in_num_head, qkv_bias=qkv_bias,
-            attn_drop=attn_drop, proj_drop=drop)
-
-        self.norm_mlp_in = norm_layer(in_dim)
-        self.mlp_in = Mlp(in_features=in_dim, hidden_features=int(in_dim * 4),
-                          out_features=in_dim, act_layer=act_layer, drop=drop)
-
-        self.norm1_proj = norm_layer(in_dim)
-        self.proj = nn.Linear(in_dim * num_pixel, dim, bias=True)
+            in_dim,  # dim parameter
+            num_heads=in_num_head,  # Only pass num_heads once
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop
+        )
         # Outer transformer
         self.norm_out = norm_layer(dim)
         self.attn_out = MCAAttention(

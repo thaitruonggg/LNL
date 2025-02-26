@@ -96,7 +96,7 @@ class LayerNorm(nn.Module):
 
 class MCAAttention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
-        super(MCAAttention, self).__init__()
+        super().__init__()
         self.num_heads = num_heads
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
 
