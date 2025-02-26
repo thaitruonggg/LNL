@@ -14,7 +14,7 @@ from timm.models.layers import DropPath, trunc_normal_
 from timm.models.vision_transformer import Mlp
 from timm.models.registry import register_model
 from models.localvit import LocalityFeedForward
-from models.tnt import MCAAttention, TNT
+from models.tnt import Attention, TNT
 import math
 
 
@@ -51,7 +51,7 @@ class Block(nn.Module):
         super().__init__()
         # Inner transformer
         self.norm_in = norm_layer(in_dim)
-        self.attn_in = MCAAttention(
+        self.attn_in = Attention(
             in_dim, in_dim, num_heads=in_num_head, qkv_bias=qkv_bias,
             attn_drop=attn_drop, proj_drop=drop)
 
@@ -63,7 +63,7 @@ class Block(nn.Module):
         self.proj = nn.Linear(in_dim * num_pixel, dim, bias=True)
         # Outer transformer
         self.norm_out = norm_layer(dim)
-        self.attn_out = MCAAttention(
+        self.attn_out = Attention(
             dim, dim, num_heads=num_heads, qkv_bias=qkv_bias,
             attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()

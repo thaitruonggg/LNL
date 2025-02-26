@@ -2,7 +2,6 @@
 Author: Omid Nejati
 Email: omid_nejaty@alumni.iust.ac.ir
 LNL : Introducing locality mechanism into Transformer in Transformer (TNT)
-New
 """
 import torch
 import torch.nn as nn
@@ -13,7 +12,7 @@ from timm.models.layers import DropPath, trunc_normal_
 from timm.models.vision_transformer import Mlp
 from timm.models.registry import register_model
 from models.localvit import LocalityFeedForward
-from models.tnt import MCAAttention, TNT
+from models.tnt import Attention, TNT
 import math
 
 
@@ -50,23 +49,21 @@ class Block(nn.Module):
         super().__init__()
         # Inner transformer
         self.norm_in = norm_layer(in_dim)
-        # Fix: Remove the redundant num_heads parameter
-        self.attn_in = MCAAttention(
-            in_dim,  # dim parameter
-            num_heads=in_num_head,  # Only pass num_heads once
-            qkv_bias=qkv_bias,
-            attn_drop=attn_drop,
-            proj_drop=drop
-        )
+        self.attn_in = Attention(
+            in_dim, in_dim, num_heads=in_num_head, qkv_bias=qkv_bias,
+            attn_drop=attn_drop, proj_drop=drop)
+
+        self.norm_mlp_in = norm_layer(in_dim)
+        self.mlp_in = Mlp(in_features=in_dim, hidden_features=int(in_dim * 4),
+                          out_features=in_dim, act_layer=act_layer, drop=drop)
+
+        self.norm1_proj = norm_layer(in_dim)
+        self.proj = nn.Linear(in_dim * num_pixel, dim, bias=True)
         # Outer transformer
         self.norm_out = norm_layer(dim)
-        self.attn_out = MCAAttention(
-            dim=dim,  # Use named parameters to avoid confusion
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            attn_drop=attn_drop,
-            proj_drop=drop
-        )
+        self.attn_out = Attention(
+            dim, dim, num_heads=num_heads, qkv_bias=qkv_bias,
+            attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         self.conv = LocalityFeedForward(dim, dim, 1, mlp_ratio, reduction=dim)
@@ -137,4 +134,4 @@ def LNL_S(pretrained=False, **kwargs):
     if pretrained:
         load_pretrained(
             model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
-    return 
+    return
