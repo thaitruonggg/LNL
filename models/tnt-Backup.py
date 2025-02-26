@@ -1,15 +1,3 @@
-"""
-Author: Omid Nejati
-Email: omid_nejaty@alumni.iust.ac.ir
-
-Code borrowed from https://github.com/rwightman/pytorch-image-models
-
-Transformer in Transformer (TNT) in PyTorch
-A PyTorch implement of TNT as described in
-'Transformer in Transformer' - https://arxiv.org/abs/2103.00112
-The official mindspore code is released and available at
-https://gitee.com/mindspore/mindspore/tree/master/model_zoo/research/cv/TNT
-"""
 import math
 import torch
 import torch.nn as nn

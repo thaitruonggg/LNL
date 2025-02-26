@@ -51,7 +51,7 @@ class Block(nn.Module):
         super().__init__()
         # Inner transformer
         self.norm_in = norm_layer(in_dim)
-        self.attn_in = Attention(
+        self.attn_in = MCAAttention(
             in_dim, in_dim, num_heads=in_num_head, qkv_bias=qkv_bias,
             attn_drop=attn_drop, proj_drop=drop)
 
@@ -63,7 +63,7 @@ class Block(nn.Module):
         self.proj = nn.Linear(in_dim * num_pixel, dim, bias=True)
         # Outer transformer
         self.norm_out = norm_layer(dim)
-        self.attn_out = Attention(
+        self.attn_out = MCAAttention(
             dim, dim, num_heads=num_heads, qkv_bias=qkv_bias,
             attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
