@@ -15,11 +15,66 @@ import torchsummary
 from torchsummary import summary
 import shutil
 from ptflops import get_model_complexity_info
+import warnings
+warnings.filterwarnings("ignore")
+torch.cuda.empty_cache()
 
 print("PyTorch", torch.__version__)
 print("Torchvision", torchvision.__version__)
 print("Torchattacks", torchattacks.__version__)
 print("Numpy", np.__version__)
+print("------------------------------------------------")
+
+
+def evaluate_model(model, test_loader, criterion, classes, batch_size, epoch, num_epochs, train_on_gpu=True,
+                   display_per_class=False):
+    test_loss = 0.0
+    num_classes = len(classes)
+    class_correct = list(0. for i in range(num_classes))
+    class_total = list(0. for i in range(num_classes))
+
+    model.eval()
+    with torch.no_grad():
+        for data, target in test_loader:
+            if train_on_gpu:
+                data, target = data.cuda(), target.cuda()
+            output = model(data)
+            loss = criterion(output, target)
+            test_loss += loss.item() * data.size(0)
+
+            _, pred = torch.max(output, 1)
+            correct_tensor = pred.eq(target.data.view_as(pred))
+            correct = np.squeeze(correct_tensor.cpu().numpy()) if train_on_gpu else np.squeeze(correct_tensor.numpy())
+
+            current_batch_size = data.size(0)
+            for i in range(current_batch_size):
+                label = target.data[i]
+                class_correct[label] += correct[i].item()
+                class_total[label] += 1
+
+    test_loss = test_loss / len(test_loader.dataset)
+    overall_accuracy = 100. * np.sum(class_correct) / np.sum(class_total)
+
+    # Print summary
+    print("--------------------------------------------------------------------")
+    # Only display per-class accuracy if display_per_class is True
+    if display_per_class:
+        print("\nPer-Class Accuracy:")
+        for i in range(num_classes):
+            if class_total[i] > 0:
+                accuracy = 100. * class_correct[i] / class_total[i]
+                print(f'Class {i} ({classes[i]}): {accuracy:.2f}% ({int(class_correct[i])}/{int(class_total[i])})')
+                print("\n")
+            else:
+                print(f'Class {i} ({classes[i]}): No samples')
+                print("\n")
+
+    print(f'Epoch [{epoch + 1}/{num_epochs}], Test Loss: {test_loss:.6f}, Overall Accuracy: {overall_accuracy:.2f}%')
+    print("--------------------------------------------------------------------")
+
+    model.train()  # Switch back to training mode
+    return test_loss, overall_accuracy
+
 
 #GTSRB
 # Organize test data
@@ -41,7 +96,7 @@ for text in image_names[1:]:
 
     shutil.copy(image_path, test_class_dir)
 
-batch_size = 15
+batch_size = 50
 
 trainset = torchvision.datasets.ImageFolder(root='GTSRB/GTSRB_Final_Training_Images/GTSRB/Final_Training/Images',
                                                 transform=transforms.Compose([
@@ -107,7 +162,7 @@ model.head = torch.nn.Linear(in_features=192, out_features=43, bias=True)
 model = model.cuda()
 
 # Train Locality-iN-Locality
-num_epochs = 5
+num_epochs = 100
 loss = nn.CrossEntropyLoss()
 optimizer = optim.SGD(model.parameters(), lr=0.007, momentum=0.9)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
@@ -127,18 +182,84 @@ for epoch in range(num_epochs):
         optimizer.step()
 
         if (i + 1) % 200 == 0:
-            print('Epoch [%d/%d], lter [%d/%d], Loss: %.6f' % (epoch + 1, num_epochs, i + 1, total_batch, cost.item()))
+            print('Epoch [%d/%d], Iter [%d/%d], Loss: %.6f' %
+                  (epoch + 1, num_epochs, i + 1, total_batch, cost.item()))
 
-# Test model
-model.eval()
-correct = 0
-total = 0
+    # Add evaluation after each epoch (without per-class accuracy)
+    test_loss, test_accuracy = evaluate_model(
+        model, test_loader, loss, testset.classes, batch_size, epoch, num_epochs, display_per_class=False
+    )
 
-for images, labels in test_loader:
-    images = images.cuda()
-    outputs = model(images)
-    _, predicted = torch.max(outputs.data, 1)
-    total += labels.size(0)
-    correct += (predicted == labels.cuda()).sum()
+print("-------------------------------------------------")
+print("Final Evaluation of Locality-iN-Locality Model")
+# Final evaluation with per-class accuracy
+final_loss, final_accuracy = evaluate_model(
+    model, test_loader, loss, testset.classes, batch_size, num_epochs - 1, num_epochs, display_per_class=True
+)
+print("-------------------------------------------------")
 
-print('Standard accuracy: %.2f %%' % (100 * float(correct) / total))
+
+# Train LNL-MoEx
+from LNL_MoEx import LNL_MoEx_Ti as small
+model = small(pretrained=False)
+model.head = torch.nn.Linear(in_features=192, out_features=43, bias=True)
+model = model.cuda()
+
+num_epochs = 100
+moex_lam = .9
+moex_prob = .7
+
+loss = nn.CrossEntropyLoss()
+optimizer = optim.SGD(model.parameters(), lr=0.007, momentum=0.9)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+
+for epoch in range(num_epochs):
+    total_batch = len(trainset) // batch_size
+
+    for i, (input, target) in enumerate(train_loader):
+        input = input.cuda()
+        target = target.cuda()
+
+        prob = torch.rand(1).item()
+        if prob < moex_prob:
+            swap_index = torch.randperm(input.size(0), device=input.device)
+            with torch.no_grad():
+                target_a = target
+                target_b = target[swap_index]
+            output = model(input, swap_index=swap_index, moex_norm='pono', moex_epsilon=1e-5,
+                           moex_layer='stem', moex_positive_only=False)
+            lam = moex_lam
+            cost = loss(output, target_a) * lam + loss(output, target_b) * (1. - lam)
+        else:
+            output = model(input)
+            cost = loss(output, target)
+
+        optimizer.zero_grad()
+        cost.backward()
+        optimizer.step()
+
+        if (i + 1) % 200 == 0:
+            print('Epoch [%d/%d], Iter [%d/%d], Loss: %.6f' %
+                  (epoch + 1, num_epochs, i + 1, total_batch, cost.item()))
+
+    # Add evaluation after each epoch (without per-class accuracy)
+    test_loss, test_accuracy = evaluate_model(
+        model, test_loader, loss, testset.classes, batch_size, epoch, num_epochs, display_per_class=False
+    )
+
+
+print("-------------------------------------------------")
+print("After applying MoEx")
+print("Final Evaluation of LNL-MoEx Model")
+# Final evaluation with per-class accuracy
+final_loss, final_accuracy = evaluate_model(
+    model, test_loader, loss, testset.classes, batch_size, num_epochs - 1, num_epochs, display_per_class=True
+)
+print("-------------------------------------------------")
+
+# Model complexity
+with torch.cuda.device(0):
+    net = model
+    macs, params = get_model_complexity_info(net, (3, 224, 224), as_strings=True, print_per_layer_stat=True, verbose=True)
+    print('{:<30}  {:<8}'.format('Computational complexity: ', macs))
+    print('{:<30}  {:<8}'.format('Number of parameters: ', params))

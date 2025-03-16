@@ -177,7 +177,7 @@ class LocalViT_TNT(TNT):
 @register_model
 def LNL_Ti(pretrained=False, **kwargs):
     model = LocalViT_TNT(patch_size=16, embed_dim=192, in_dim=12, depth=12, num_heads=3, in_num_head=3,
-                         qkv_bias=False, **kwargs)
+                         qkv_bias=False, **kwargs) #Old patch_size = 16
     model.default_cfg = default_cfgs['tnt_t_conv_patch16_224']
     if pretrained:
         load_pretrained(
@@ -188,7 +188,7 @@ def LNL_Ti(pretrained=False, **kwargs):
 @register_model
 def LNL_S(pretrained=False, **kwargs):
     model = LocalViT_TNT(patch_size=16, embed_dim=384, in_dim=24, depth=12, num_heads=6, in_num_head=4,
-                         qkv_bias=False, **kwargs)
+                         qkv_bias=False, **kwargs) #Old patch_size = 16
     model.default_cfg = default_cfgs['tnt_s_conv_patch16_224']
     if pretrained:
         load_pretrained(

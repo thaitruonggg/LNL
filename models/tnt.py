@@ -1,7 +1,18 @@
+"""
+Author: Omid Nejati
+Email: omid_nejaty@alumni.iust.ac.ir
+
+Code borrowed from https://github.com/rwightman/pytorch-image-models
+
+Transformer in Transformer (TNT) in PyTorch
+A PyTorch implement of TNT as described in
+'Transformer in Transformer' - https://arxiv.org/abs/2103.00112
+The official mindspore code is released and available at
+https://gitee.com/mindspore/mindspore/tree/master/model_zoo/research/cv/TNT
+"""
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from functools import partial
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
@@ -37,7 +48,7 @@ default_cfgs = {
 
 
 class Attention(nn.Module):
-    """ Cross-Attention based on MCA implementation
+    """ Multi-Head Attention
     """
 
     def __init__(self, dim, hidden_dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
@@ -46,99 +57,29 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         head_dim = hidden_dim // num_heads
         self.head_dim = head_dim
-        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.scale = head_dim ** -0.5
 
-        # Projection layers
         self.qk = nn.Linear(dim, hidden_dim * 2, bias=qkv_bias)
         self.v = nn.Linear(dim, dim, bias=qkv_bias)
-
-        # Cross-attention specific components
-        self.norm1 = nn.LayerNorm(dim)
-        self.project_out = nn.Linear(dim, dim)
-
-        # Convolutional components for cross-attention
-        self.conv0_1 = nn.Conv1d(dim, dim, 7, padding=3, groups=dim)
-        self.conv0_2 = nn.Conv1d(dim, dim, 7, padding=3, groups=dim)
-        self.conv1_1 = nn.Conv1d(dim, dim, 11, padding=5, groups=dim)
-        self.conv1_2 = nn.Conv1d(dim, dim, 11, padding=5, groups=dim)
-        self.conv2_1 = nn.Conv1d(dim, dim, 21, padding=10, groups=dim)
-        self.conv2_2 = nn.Conv1d(dim, dim, 21, padding=10, groups=dim)
-
         self.attn_drop = nn.Dropout(attn_drop, inplace=True)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop, inplace=True)
 
     def forward(self, x):
         B, N, C = x.shape
+        qk = self.qk(x).reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k = qk[0], qk[1]  # make torchscript happy (cannot use tensor as tuple)
+        v = self.v(x).reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
 
-        # Apply normalization
-        x1 = self.norm1(x)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        weights = attn
+        attn = self.attn_drop(attn)
 
-        # Reshape for 1D convolutions
-        x1_reshaped = x1.transpose(1, 2)  # B, C, N
-
-        # Apply 1D convolutions
-        attn_00 = self.conv0_1(x1_reshaped)
-        attn_01 = self.conv0_2(x1_reshaped)
-        attn_10 = self.conv1_1(x1_reshaped)
-        attn_11 = self.conv1_2(x1_reshaped)
-        attn_20 = self.conv2_1(x1_reshaped)
-        attn_21 = self.conv2_2(x1_reshaped)
-
-        # Combine outputs
-        out1 = attn_00 + attn_10 + attn_20  # B, C, N
-        out2 = attn_01 + attn_11 + attn_21  # B, C, N
-
-        # Reshape back to sequence format
-        out1 = out1.transpose(1, 2)  # B, N, C
-        out2 = out2.transpose(1, 2)  # B, N, C
-
-        # Project outputs
-        out1 = self.project_out(out1)
-        out2 = self.project_out(out2)
-
-        # Reshape for multi-head attention
-        k1 = out1.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)  # B, num_heads, N, head_dim
-        v1 = out1.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
-        k2 = out2.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
-        v2 = out2.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
-        q1 = out2.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
-        q2 = out1.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
-
-        # Normalize queries and keys
-        q1 = F.normalize(q1, dim=-1)
-        q2 = F.normalize(q2, dim=-1)
-        k1 = F.normalize(k1, dim=-1)
-        k2 = F.normalize(k2, dim=-1)
-
-        # Compute attention scores
-        attn1 = (q1 @ k1.transpose(-2, -1))
-        attn1 = attn1.softmax(dim=-1)
-        attn1 = self.attn_drop(attn1)
-
-        attn2 = (q2 @ k2.transpose(-2, -1))
-        attn2 = attn2.softmax(dim=-1)
-        attn2 = self.attn_drop(attn2)
-
-        # Apply attention weights
-        out3 = (attn1 @ v1) + q1
-        out4 = (attn2 @ v2) + q2
-
-        # Reshape back
-        out3 = out3.transpose(1, 2).reshape(B, N, C)  # B, N, C
-        out4 = out4.transpose(1, 2).reshape(B, N, C)  # B, N, C
-
-        # Final projections
-        out3 = self.proj(out3)
-        out4 = self.proj(out4)
-
-        # Combine outputs with residual connection
-        out = self.proj_drop(out3 + out4) + x
-
-        # For compatibility with the original TNT code, return attention weights
-        weights = (attn1 + attn2) / 2  # Average the attention weights
-
-        return out, weights
+        x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x, weights
 
 
 class Block(nn.Module):
@@ -186,8 +127,7 @@ class Block(nn.Module):
 
 
 class PixelEmbed(nn.Module):
-    """ Image to Pixel Embedding
-    """
+    # Image to Pixel Embedding
 
     def __init__(self, img_size=224, patch_size=16, in_chans=3, in_dim=48, stride=4):
         super().__init__()
@@ -205,17 +145,26 @@ class PixelEmbed(nn.Module):
         B, C, H, W = x.shape
         assert H == self.img_size and W == self.img_size, \
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size}*{self.img_size})."
-        x = self.proj(x)
-        x = self.unfold(x)
-        x = x.transpose(1, 2).reshape(B * self.num_patches, self.in_dim, self.new_patch_size, self.new_patch_size)
-        x = x + pixel_pos
-        x = x.reshape(B * self.num_patches, self.in_dim, -1).transpose(1, 2)
+
+        # Apply convolution
+        x = self.proj(x)  # Shape: (B, in_dim, H/stride, W/stride)
+        # Unfold into patches
+        x = self.unfold(x)  # Shape: (B, in_dim * new_patch_size^2, num_patches)
+        # Reshape to maintain batch size
+        x = x.transpose(1, 2).reshape(B, self.num_patches, self.in_dim, self.new_patch_size, self.new_patch_size)
+        # Add positional encoding
+        x = x + pixel_pos  # Shape: (B, num_patches, in_dim, new_patch_size, new_patch_size)
+        # Flatten spatial dimensions
+        x = x.reshape(B, self.num_patches, self.in_dim, -1).transpose(2,
+                                                                      3)  # Shape: (B, num_patches, new_patch_size^2, in_dim)
+        # Flatten for inner transformer
+        x = x.reshape(B, self.num_patches * self.new_patch_size ** 2,
+                      self.in_dim)  # Shape: (B, num_patches * new_patch_size^2, in_dim)
         return x
 
 
 class TNT(nn.Module):
-    """ Transformer in Transformer - https://arxiv.org/abs/2103.00112
-    """
+    # Transformer in Transformer - https://arxiv.org/abs/2103.00112
 
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, in_dim=48, depth=12,
                  num_heads=12, in_num_head=4, mlp_ratio=4., qkv_bias=False, drop_rate=0., attn_drop_rate=0.,
@@ -301,34 +250,36 @@ class TNT(nn.Module):
         else:
             return x
 
-    @register_model
-    def tnt_t_patch16_224(pretrained=False, **kwargs):
-        model = TNT(patch_size=16, embed_dim=192, in_dim=12, depth=12, num_heads=3, in_num_head=3,
-                    qkv_bias=False, **kwargs)
-        model.default_cfg = default_cfgs['tnt_t_patch16_224']
-        if pretrained:
-            load_pretrained(
-                model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
-        return model
 
-    @register_model
-    def tnt_s_patch16_224(pretrained=False, **kwargs):
-        model = TNT(patch_size=16, embed_dim=384, in_dim=24, depth=12, num_heads=6, in_num_head=4,
-                    qkv_bias=False, **kwargs)
-        model.default_cfg = default_cfgs['tnt_s_patch16_224']
-        if pretrained:
-            load_pretrained(
-                model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
-        return model
+@register_model
+def tnt_t_patch16_224(pretrained=False, **kwargs):
+    model = TNT(patch_size=16, embed_dim=192, in_dim=12, depth=12, num_heads=3, in_num_head=3,
+                qkv_bias=False, **kwargs)
+    model.default_cfg = default_cfgs['tnt_t_patch16_224']
+    if pretrained:
+        load_pretrained(
+            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    return model
 
-    @register_model
-    def tnt_b_patch16_224(pretrained=False, **kwargs):
-        model = TNT(patch_size=16, embed_dim=640, in_dim=40, depth=12, num_heads=10, in_num_head=4,
-                    qkv_bias=False, **kwargs)
-        model.default_cfg = default_cfgs['tnt_b_patch16_224']
-        if pretrained:
-            load_pretrained(
-                model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
-        return model
 
+@register_model
+def tnt_s_patch16_224(pretrained=False, **kwargs):
+    model = TNT(patch_size=16, embed_dim=384, in_dim=24, depth=12, num_heads=6, in_num_head=4,
+                qkv_bias=False, **kwargs)
+    model.default_cfg = default_cfgs['tnt_s_patch16_224']
+    if pretrained:
+        load_pretrained(
+            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    return model
+
+
+@register_model
+def tnt_b_patch16_224(pretrained=False, **kwargs):
+    model = TNT(patch_size=16, embed_dim=640, in_dim=40, depth=12, num_heads=10, in_num_head=4,
+                qkv_bias=False, **kwargs)
+    model.default_cfg = default_cfgs['tnt_b_patch16_224']
+    if pretrained:
+        load_pretrained(
+            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    return model
 

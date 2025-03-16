@@ -72,7 +72,7 @@ class SELayer(nn.Module):
 
 class LocalityFeedForward(nn.Module):
     def __init__(self, in_dim, out_dim, stride, expand_ratio=4., act='hs+se', reduction=4,
-                 wo_dp_conv=False, dp_first=False, kernel_size=3):
+                 wo_dp_conv=False, dp_first=False):
         """
         :param in_dim: the input dimension
         :param out_dim: the output dimension. The input and output dimension should be the same.
@@ -87,11 +87,10 @@ class LocalityFeedForward(nn.Module):
         :param reduction: reduction rate in SE module.
         :param wo_dp_conv: without depth-wise convolution.
         :param dp_first: place depth-wise convolution as the first layer.
-        :param kernel_size: kernel size of the depth-wise convolution (e.g., 3, 5, 7)
         """
         super(LocalityFeedForward, self).__init__()
-        self.kernel_size = kernel_size
         hidden_dim = int(in_dim * expand_ratio)
+        kernel_size = 3
 
         layers = []
         # the first linear layer is replaced by 1x1 convolution.
@@ -103,8 +102,7 @@ class LocalityFeedForward(nn.Module):
         # the depth-wise convolution between the two linear layers
         if not wo_dp_conv:
             dp = [
-                nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, kernel_size // 2,
-                          groups=hidden_dim, bias=False),
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, kernel_size // 2, groups=hidden_dim, bias=False),
                 nn.BatchNorm2d(hidden_dim),
                 h_swish() if act.find('hs') >= 0 else nn.ReLU6(inplace=True)
             ]
@@ -182,7 +180,7 @@ class Attention(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, qk_reduce=1, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, act='hs+se', reduction=4, wo_dp_conv=False, dp_first=False, kernel_size=3):
+                 drop_path=0., norm_layer=nn.LayerNorm, act='hs+se', reduction=4, wo_dp_conv=False, dp_first=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
@@ -191,7 +189,7 @@ class Block(nn.Module):
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         # The MLP is replaced by the conv layers.
-        self.conv = LocalityFeedForward(dim, dim, 1, mlp_ratio, act, reduction, wo_dp_conv, dp_first, kernel_size)
+        self.conv = LocalityFeedForward(dim, dim, 1, mlp_ratio, act, reduction, wo_dp_conv, dp_first)
 
     def forward(self, x):
         batch_size, num_token, embed_dim = x.shape                                  # (B, 197, dim)
@@ -248,15 +246,18 @@ class TransformerLayer(nn.Module):
 
 
 class LocalVisionTransformer(VisionTransformer):
+    """ Vision Transformer with support for patch or hybrid CNN input stage
+    """
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm,
                  act=3, reduction=4, wo_dp_conv=False, dp_first=False):
+        # print(hybrid_backbone is None)
         super().__init__(img_size, patch_size, in_chans, num_classes, embed_dim, depth,
                          num_heads, mlp_ratio, qkv_bias, qk_scale, drop_rate, attn_drop_rate,
                          drop_path_rate, hybrid_backbone, norm_layer)
 
-        # Parse activation type
+        # parse act
         if act == 1:
             act = 'relu6'
         elif act == 2:
@@ -268,19 +269,16 @@ class LocalVisionTransformer(VisionTransformer):
         else:
             act = 'hs+ecah'
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # Stochastic depth decay
-
-        # Dynamic kernel size: larger in early layers (7), smaller in later layers (3)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                act=act, reduction=reduction, wo_dp_conv=wo_dp_conv, dp_first=dp_first,
-                kernel_size=7 if i < depth // 3 else 5 if i < 2 * depth // 3 else 3
+                act=act, reduction=reduction, wo_dp_conv=wo_dp_conv, dp_first=dp_first
             )
-            for i in range(depth)
-        ])
+            for i in range(depth)])
         self.norm = norm_layer(embed_dim)
+
         self.apply(self._init_weights)
 
 
