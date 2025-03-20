@@ -1,19 +1,8 @@
-"""
-Author: Omid Nejati
-Email: omid_nejaty@alumni.iust.ac.ir
-
-Code borrowed from https://github.com/rwightman/pytorch-image-models
-
-Transformer in Transformer (TNT) in PyTorch
-A PyTorch implement of TNT as described in
-'Transformer in Transformer' - https://arxiv.org/abs/2103.00112
-The official mindspore code is released and available at
-https://gitee.com/mindspore/mindspore/tree/master/model_zoo/research/cv/TNT
-"""
 import math
 import torch
 import torch.nn as nn
 from functools import partial
+import random
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.helpers import load_pretrained
@@ -21,65 +10,41 @@ from timm.models.layers import DropPath, trunc_normal_
 from timm.models.vision_transformer import Mlp
 from timm.models.registry import register_model
 
-def moex(x, swap_index, norm_type, epsilon=1e-5, positive_only=False):
-    '''MoEx operation'''
-    dtype = x.dtype
-    x = x.float()
+# Random Erasing implementation
+# https://github.com/zhunzhong07/Random-Erasing/blob/master/transforms.py
+def random_erasing(x, probability=0.5, sl=0.01, sh=0.2, r1=0.3, mean=(0.5, 0.5, 0.5)):
+    """
+    Random Erasing augmentation.
+    Args:
+        x (Tensor): Input image tensor of shape (B, C, H, W).
+        probability (float): Probability of applying random erasing.
+        sl (float): Minimum proportion of erased area relative to input image.
+        sh (float): Maximum proportion of erased area relative to input image.
+        r1 (float): Minimum aspect ratio of erased area.
+        mean (tuple): Mean values for each channel (used as fill value).
+    Returns:
+        Tensor: Image tensor with random erasing applied (or unchanged if not applied).
+    """
+    if random.random() > probability:
+        return x
 
-    B, C, L = x.shape
-    if norm_type == 'bn':
-        norm_dims = [0, 2, 3]
-    elif norm_type == 'in':
-        norm_dims = [2, 3]
-    elif norm_type == 'ln':
-        norm_dims = [1, 2, 3]
-    elif norm_type == 'pono':
-        norm_dims = [1]
-    elif norm_type.startswith('gn'):
-        if norm_type.startswith('gn-d'):
-            # gn-d4 means GN where each group has 4 dims
-            G_dim = int(norm_type[4:])
-            G = C // G_dim
-        else:
-            # gn4 means GN with 4 groups
-            G = int(norm_type[2:])
-            G_dim = C // G
-        x = x.view(B, G, G_dim, H, W)
-        norm_dims = [2, 3, 4]
-    elif norm_type.startswith('gpono'):
-        if norm_type.startswith('gpono-d'):
-            # gpono-d4 means GPONO where each group has 4 dims
-            G_dim = int(norm_type[len('gpono-d'):])
-            G = C // G_dim
-        else:
-            # gpono4 means GPONO with 4 groups
-            G = int(norm_type[len('gpono'):])
-            G_dim = C // G
-        x = x.view(B, G, G_dim, H, W)
-        norm_dims = [2]
-    else:
-        raise NotImplementedError(f'norm_type={norm_type}')
+    B, C, H, W = x.shape
+    area = H * W
 
-    if positive_only:
-        x_pos = F.relu(x)
-        s1 = x_pos.sum(dim=norm_dims, keepdim=True)
-        s2 = x_pos.pow(2).sum(dim=norm_dims, keepdim=True)
-        count = x_pos.gt(0).sum(dim=norm_dims, keepdim=True)
-        count[count == 0] = 1  # deal with 0/0
-        mean = s1 / count
-        var = s2 / count - mean.pow(2)
-        std = var.add(epsilon).sqrt()
-    else:
-        mean = x.mean(dim=norm_dims, keepdim=True)
-        std = x.var(dim=norm_dims, keepdim=True).add(epsilon).sqrt()
-    swap_mean = mean[swap_index]
-    swap_std = std[swap_index]
-    # output = (x - mean) / std * swap_std + swap_mean
-    # equvalent but for efficient
-    scale = swap_std / std
-    shift = swap_mean - mean * scale
-    output = x * scale + shift
-    return output.view(B, C, L).to(dtype)
+    for _ in range(10):  # Retry up to 10 times to find a valid region
+        target_area = random.uniform(sl, sh) * area
+        aspect_ratio = random.uniform(r1, 1/r1)
+        h = int(round(math.sqrt(target_area * aspect_ratio)))
+        w = int(round(math.sqrt(target_area / aspect_ratio)))
+
+        if h < H and w < W:
+            x0 = random.randint(0, H - h)
+            y0 = random.randint(0, W - w)
+            # Apply erasing by setting the region to the mean value
+            x[:, :, x0:x0+h, y0:y0+w] = torch.tensor(mean, device=x.device).view(1, C, 1, 1)
+            return x
+
+    return x  # Return unchanged if no valid region found
 
 def _cfg(url='', **kwargs):
     return {
@@ -90,7 +55,6 @@ def _cfg(url='', **kwargs):
         'first_conv': 'pixel_embed.proj', 'classifier': 'head',
         **kwargs
     }
-
 
 default_cfgs = {
     'tnt_t_patch16_224': _cfg(
@@ -105,10 +69,8 @@ default_cfgs = {
     ),
 }
 
-
 class Attention(nn.Module):
-    """ Multi-Head Attention
-    """
+    # Multi-head attention
 
     def __init__(self, dim, hidden_dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
@@ -127,7 +89,7 @@ class Attention(nn.Module):
     def forward(self, x):
         B, N, C = x.shape
         qk = self.qk(x).reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k = qk[0], qk[1]  # make torchscript happy (cannot use tensor as tuple)
+        q, k = qk[0], qk[1]
         v = self.v(x).reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -140,15 +102,10 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x, weights
 
-
 class Block(nn.Module):
-    """ TNT Block
-    """
-
     def __init__(self, dim, in_dim, num_pixel, num_heads=12, in_num_head=4, mlp_ratio=4.,
                  qkv_bias=False, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
-        # Inner transformer
         self.norm_in = norm_layer(in_dim)
         self.attn_in = Attention(
             in_dim, in_dim, num_heads=in_num_head, qkv_bias=qkv_bias,
@@ -160,7 +117,6 @@ class Block(nn.Module):
 
         self.norm1_proj = norm_layer(in_dim)
         self.proj = nn.Linear(in_dim * num_pixel, dim, bias=True)
-        # Outer transformer
         self.norm_out = norm_layer(dim)
         self.attn_out = Attention(
             dim, dim, num_heads=num_heads, qkv_bias=qkv_bias,
@@ -172,11 +128,9 @@ class Block(nn.Module):
                        out_features=dim, act_layer=act_layer, drop=drop)
 
     def forward(self, pixel_embed, patch_embed):
-        # inner
         x, _ = self.attn_in(self.norm_in(pixel_embed))
         pixel_embed = pixel_embed + self.drop_path(x)
         pixel_embed = pixel_embed + self.drop_path(self.mlp_in(self.norm_mlp_in(pixel_embed)))
-        # outer
         B, N, C = patch_embed.size()
         patch_embed[:, 1:] = patch_embed[:, 1:] + self.proj(self.norm1_proj(pixel_embed).reshape(B, N - 1, -1))
         x, weights = self.attn_out(self.norm_out(patch_embed))
@@ -184,11 +138,7 @@ class Block(nn.Module):
         patch_embed = patch_embed + self.drop_path(self.mlp(self.norm_mlp(patch_embed)))
         return pixel_embed, patch_embed, weights
 
-
 class PixelEmbed(nn.Module):
-    """ Image to Pixel Embedding
-    """
-
     def __init__(self, img_size=224, patch_size=16, in_chans=3, in_dim=48, stride=4):
         super().__init__()
         num_patches = (img_size // patch_size) ** 2
@@ -212,17 +162,13 @@ class PixelEmbed(nn.Module):
         x = x.reshape(B * self.num_patches, self.in_dim, -1).transpose(1, 2)
         return x
 
-
 class TNT(nn.Module):
-    """ Transformer in Transformer - https://arxiv.org/abs/2103.00112
-    """
-
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, in_dim=48, depth=12,
                  num_heads=12, in_num_head=4, mlp_ratio=4., qkv_bias=False, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=nn.LayerNorm, first_stride=4):
         super().__init__()
         self.num_classes = num_classes
-        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
+        self.num_features = self.embed_dim = embed_dim
 
         self.pixel_embed = PixelEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, in_dim=in_dim, stride=first_stride)
@@ -240,7 +186,7 @@ class TNT(nn.Module):
         self.pixel_pos = nn.Parameter(torch.zeros(1, in_dim, new_patch_size, new_patch_size))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         blocks = []
         for i in range(depth):
             blocks.append(Block(
@@ -277,20 +223,19 @@ class TNT(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def forward_features(self, x, swap_index, moex_norm, moex_epsilon,
-                moex_layer, moex_positive_only):
+    def forward_features(self, x, apply_erasing=False):
         attn_weights = []
         B = x.shape[0]
-        pixel_embed = self.pixel_embed(x, self.pixel_pos)
 
+        # Apply Random Erasing if specified
+        if apply_erasing:
+            x = random_erasing(x)
+
+        pixel_embed = self.pixel_embed(x, self.pixel_pos)
         patch_embed = self.norm2_proj(self.proj(self.norm1_proj(pixel_embed.reshape(B, self.num_patches, -1))))
         patch_embed = torch.cat((self.cls_token.expand(B, -1, -1), patch_embed), dim=1)
         patch_embed = patch_embed + self.patch_pos
         patch_embed = self.pos_drop(patch_embed)
-
-        # moex
-        if swap_index is not None and moex_layer == 'stem':
-            patch_embed = moex(patch_embed, swap_index, moex_norm, moex_epsilon, moex_positive_only)
 
         for blk in self.blocks:
             pixel_embed, patch_embed, weights = blk(pixel_embed, patch_embed)
@@ -298,16 +243,13 @@ class TNT(nn.Module):
         patch_embed = self.norm(patch_embed)
         return patch_embed[:, 0], attn_weights
 
-    def forward(self, x, swap_index=None, moex_norm='pono', moex_epsilon=1e-5,
-                moex_layer='stem', moex_positive_only=False, vis=False):
-        x, attn_weights = self.forward_features(x, swap_index, moex_norm, moex_epsilon,
-                moex_layer, moex_positive_only)
+    def forward(self, x, apply_erasing=False, vis=False):
+        x, attn_weights = self.forward_features(x, apply_erasing)
         x = self.head(x)
         if vis:
             return x, attn_weights
         else:
             return x
-
 
 @register_model
 def tnt_t_patch16_224(pretrained=False, **kwargs):
@@ -315,10 +257,8 @@ def tnt_t_patch16_224(pretrained=False, **kwargs):
                 qkv_bias=False, **kwargs)
     model.default_cfg = default_cfgs['tnt_t_patch16_224']
     if pretrained:
-        load_pretrained(
-            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+        load_pretrained(model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
     return model
-
 
 @register_model
 def tnt_s_patch16_224(pretrained=False, **kwargs):
@@ -326,10 +266,8 @@ def tnt_s_patch16_224(pretrained=False, **kwargs):
                 qkv_bias=False, **kwargs)
     model.default_cfg = default_cfgs['tnt_s_patch16_224']
     if pretrained:
-        load_pretrained(
-            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+        load_pretrained(model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
     return model
-
 
 @register_model
 def tnt_b_patch16_224(pretrained=False, **kwargs):
@@ -337,6 +275,5 @@ def tnt_b_patch16_224(pretrained=False, **kwargs):
                 qkv_bias=False, **kwargs)
     model.default_cfg = default_cfgs['tnt_b_patch16_224']
     if pretrained:
-        load_pretrained(
-            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+        load_pretrained(model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
     return model

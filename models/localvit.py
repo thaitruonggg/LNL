@@ -2,7 +2,7 @@
 Author: Omid Nejati
 Email: omid_nejaty@alumni.iust.ac.ir
 
-Introducing locality mechanism to "DeiT: Data-efficient Image Transformers".
+Introducing locality mechanism to "DeiT: Data-efficient Image Transformers" with Shifted Window Attention.
 """
 import torch
 import torch.nn as nn
@@ -73,34 +73,16 @@ class SELayer(nn.Module):
 class LocalityFeedForward(nn.Module):
     def __init__(self, in_dim, out_dim, stride, expand_ratio=4., act='hs+se', reduction=4,
                  wo_dp_conv=False, dp_first=False, kernel_size=3):
-        """
-        :param in_dim: the input dimension
-        :param out_dim: the output dimension. The input and output dimension should be the same.
-        :param stride: stride of the depth-wise convolution.
-        :param expand_ratio: expansion ratio of the hidden dimension.
-        :param act: the activation function.
-                    relu: ReLU
-                    hs: h_swish
-                    hs+se: h_swish and SE module
-                    hs+eca: h_swish and ECA module
-                    hs+ecah: h_swish and ECA module. Compared with eca, h_sigmoid is used.
-        :param reduction: reduction rate in SE module.
-        :param wo_dp_conv: without depth-wise convolution.
-        :param dp_first: place depth-wise convolution as the first layer.
-        :param kernel_size: kernel size of the depth-wise convolution (e.g., 3, 5, 7)
-        """
         super(LocalityFeedForward, self).__init__()
         self.kernel_size = kernel_size
         hidden_dim = int(in_dim * expand_ratio)
 
         layers = []
-        # the first linear layer is replaced by 1x1 convolution.
         layers.extend([
             nn.Conv2d(in_dim, hidden_dim, 1, 1, 0, bias=False),
             nn.BatchNorm2d(hidden_dim),
             h_swish() if act.find('hs') >= 0 else nn.ReLU6(inplace=True)])
 
-        # the depth-wise convolution between the two linear layers
         if not wo_dp_conv:
             dp = [
                 nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, kernel_size // 2,
@@ -122,7 +104,6 @@ class LocalityFeedForward(nn.Module):
             else:
                 raise NotImplementedError('Activation type {} is not implemented'.format(act))
 
-        # the second linear layer is replaced by 1x1 convolution.
         layers.extend([
             nn.Conv2d(hidden_dim, out_dim, 1, 1, 0, bias=False),
             nn.BatchNorm2d(out_dim)
@@ -134,43 +115,51 @@ class LocalityFeedForward(nn.Module):
         return x
 
 
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, qk_reduce=1, attn_drop=0., proj_drop=0.):
-        """
-        :param dim:
-        :param num_heads:
-        :param qkv_bias:
-        :param qk_scale:
-        :param qk_reduce: reduce the output dimension for QK projection
-        :param attn_drop:
-        :param proj_drop:
-        """
+class WindowAttention(nn.Module):
+    def __init__(self, dim, window_size, num_heads, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
+        self.dim = dim
+        self.window_size = window_size  # Assumes square windows (e.g., 7)
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
-        self.scale = qk_scale or head_dim ** -0.5
-        self.qk_reduce = qk_reduce
-        self.dim = dim
-        self.qk_dim = int(dim / self.qk_reduce)
+        self.scale = head_dim ** -0.5
 
-        self.qkv = nn.Linear(dim, int(dim * (1 + 1 / qk_reduce * 2)), bias=qkv_bias)
+        # QKV projection
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+        # Relative position bias table
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads))
+        coords_h = torch.arange(self.window_size)
+        coords_w = torch.arange(self.window_size)
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))  # 2, Wh, Ww
+        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+        relative_coords[:, :, 0] += self.window_size - 1  # Shift to start from 0
+        relative_coords[:, :, 1] += self.window_size - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size - 1
+        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+        self.register_buffer("relative_position_index", relative_position_index)
+
+    def forward(self, x, mask=None):
         B, N, C = x.shape
-        if self.qk_reduce == 1:
-            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-            q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
-        else:
-            q, k, v = torch.split(self.qkv(x), [self.qk_dim, self.qk_dim, self.dim], dim=-1)
-            q = q.reshape(B, N, self.num_heads, -1).transpose(1, 2)
-            k = k.reshape(B, N, self.num_heads, -1).transpose(1, 2)
-            v = v.reshape(B, N, self.num_heads, -1).transpose(1, 2)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # B, num_heads, N, head_dim
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size * self.window_size, self.window_size * self.window_size, -1)
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -181,82 +170,94 @@ class Attention(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, qk_reduce=1, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm, act='hs+se', reduction=4, wo_dp_conv=False, dp_first=False, kernel_size=3):
-        super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.attn = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, qk_reduce=qk_reduce,
-            attn_drop=attn_drop, proj_drop=drop)
-        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        # The MLP is replaced by the conv layers.
-        self.conv = LocalityFeedForward(dim, dim, 1, mlp_ratio, act, reduction, wo_dp_conv, dp_first, kernel_size)
-
-    def forward(self, x):
-        batch_size, num_token, embed_dim = x.shape                                  # (B, 197, dim)
-        patch_size = int(math.sqrt(num_token))
-
-        x = x + self.drop_path(self.attn(self.norm1(x)))                            # (B, 197, dim)
-        # Split the class token and the image token.
-        cls_token, x = torch.split(x, [1, num_token - 1], dim=1)                    # (B, 1, dim), (B, 196, dim)
-        # Reshape and update the image token.
-        x = x.transpose(1, 2).view(batch_size, embed_dim, patch_size, patch_size)   # (B, dim, 14, 14)
-        x = self.conv(x).flatten(2).transpose(1, 2)                                 # (B, 196, dim)
-        # Concatenate the class token and the newly computed image token.
-        x = torch.cat([cls_token, x], dim=1)
-        return x
-
-
-class TransformerLayer(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm):
+                 drop_path=0., norm_layer=nn.LayerNorm, act='hs+se', reduction=4, wo_dp_conv=False, dp_first=False,
+                 window_size=7, kernel_size=3):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        self.attn = WindowAttention(
+            dim, window_size=window_size, num_heads=num_heads, qkv_bias=qkv_bias,
+            attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
-        #########################################
-        # Origianl implementation
-        # self.norm2 = norm_layer(dim)
-        #         mlp_hidden_dim = int(dim * mlp_ratio)
-        #         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-        #########################################
-
-        # Replace the MLP layer by LocalityFeedForward.
-        self.conv = LocalityFeedForward(dim, dim, 1, mlp_ratio, act='hs+se', reduction=dim//4)
+        self.conv = LocalityFeedForward(dim, dim, 1, mlp_ratio, act, reduction, wo_dp_conv, dp_first, kernel_size)
+        self.window_size = window_size
 
     def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-        #########################################
-        # Origianl implementation
-        # x = x + self.drop_path(self.mlp(self.norm2(x)))
-        #########################################
+        B, N, C = x.shape
+        patch_size = int(math.sqrt(N - 1))  # Exclude CLS token
+        assert patch_size % self.window_size == 0, "Patch size must be divisible by window size"
 
-        # Change the computation accordingly in three steps.
-        batch_size, num_token, embed_dim = x.shape
-        patch_size = int(math.sqrt(num_token))
-        # 1. Split the class token and the image token.
-        cls_token, x = torch.split(x, [1, embed_dim - 1], dim=1)
-        # 2. Reshape and update the image token.
-        x = x.transpose(1, 2).view(batch_size, embed_dim, patch_size, patch_size)
+        # Split CLS token
+        cls_token, x = torch.split(x, [1, N - 1], dim=1)  # (B, 1, C), (B, N-1, C)
+
+        # Reshape to spatial grid
+        x = x.view(B, patch_size, patch_size, C)
+
+        # Cyclic shift (for odd layers, shift by window_size//2)
+        shift_size = self.window_size // 2 if self.training else 0  # Shift only during training
+        if shift_size > 0:
+            x = torch.roll(x, shifts=(-shift_size, -shift_size), dims=(1, 2))
+
+        # Partition into windows
+        num_windows = (patch_size // self.window_size) ** 2
+        x = x.view(B, patch_size // self.window_size, self.window_size,
+                   patch_size // self.window_size, self.window_size, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, self.window_size * self.window_size, C)  # B*nW, Wh*Ww, C
+
+        # Create attention mask for shifted windows
+        if shift_size > 0:
+            attn_mask = self.create_shifted_mask(patch_size, self.window_size, shift_size)
+        else:
+            attn_mask = None
+
+        # Apply window attention
+        x = self.attn(x, attn_mask)
+        x = x.view(B, patch_size // self.window_size, patch_size // self.window_size,
+                   self.window_size, self.window_size, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, patch_size, patch_size, C)
+
+        # Reverse cyclic shift
+        if shift_size > 0:
+            x = torch.roll(x, shifts=(shift_size, shift_size), dims=(1, 2))
+
+        # Flatten back to token sequence and reattach CLS token
+        x = x.view(B, -1, C)
+        x = torch.cat([cls_token, x], dim=1)
+
+        # Apply LocalityFeedForward
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        cls_token, x = torch.split(x, [1, N - 1], dim=1)
+        x = x.transpose(1, 2).view(B, C, patch_size, patch_size)
         x = self.conv(x).flatten(2).transpose(1, 2)
-        # 3. Concatenate the class token and the newly computed image token.
         x = torch.cat([cls_token, x], dim=1)
         return x
+
+    def create_shifted_mask(self, patch_size, window_size, shift_size):
+        mask = torch.zeros((1, patch_size, patch_size, 1))
+        h_slices = (slice(0, -window_size), slice(-window_size, -shift_size), slice(-shift_size, None))
+        w_slices = (slice(0, -window_size), slice(-window_size, -shift_size), slice(-shift_size, None))
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                mask[:, h, w, :] = cnt
+                cnt += 1
+        mask_windows = mask.view(1, patch_size // window_size, window_size,
+                                 patch_size // window_size, window_size, 1)
+        mask_windows = mask_windows.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size * window_size, 1)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        return attn_mask
 
 
 class LocalVisionTransformer(VisionTransformer):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm,
-                 act=3, reduction=4, wo_dp_conv=False, dp_first=False):
+                 act=3, reduction=4, wo_dp_conv=False, dp_first=False, window_size=7):
         super().__init__(img_size, patch_size, in_chans, num_classes, embed_dim, depth,
                          num_heads, mlp_ratio, qkv_bias, qk_scale, drop_rate, attn_drop_rate,
                          drop_path_rate, hybrid_backbone, norm_layer)
 
-        # Parse activation type
         if act == 1:
             act = 'relu6'
         elif act == 2:
@@ -268,21 +269,18 @@ class LocalVisionTransformer(VisionTransformer):
         else:
             act = 'hs+ecah'
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # Stochastic depth decay
-
-        # Dynamic kernel size: larger in early layers (7), smaller in later layers (3)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
                 act=act, reduction=reduction, wo_dp_conv=wo_dp_conv, dp_first=dp_first,
-                kernel_size=7 if i < depth // 3 else 5 if i < 2 * depth // 3 else 3
+                window_size=window_size, kernel_size=7 if i < depth // 3 else 5 if i < 2 * depth // 3 else 3
             )
             for i in range(depth)
         ])
         self.norm = norm_layer(embed_dim)
         self.apply(self._init_weights)
-
 
 
 @register_model
@@ -293,7 +291,6 @@ def localvit_tiny_mlp6_act1(pretrained=False, **kwargs):
     return model
 
 
-# reduction = 4
 @register_model
 def localvit_tiny_mlp4_act3_r4(pretrained=False, **kwargs):
     model = LocalVisionTransformer(
@@ -301,7 +298,7 @@ def localvit_tiny_mlp4_act3_r4(pretrained=False, **kwargs):
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
-# reduction = 192
+
 @register_model
 def localvit_tiny_mlp4_act3_r192(pretrained=False, **kwargs):
     model = LocalVisionTransformer(

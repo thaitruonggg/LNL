@@ -56,7 +56,6 @@ def evaluate_model(model, test_loader, criterion, classes, batch_size, epoch, nu
     overall_accuracy = 100. * np.sum(class_correct) / np.sum(class_total)
 
     # Print summary
-    print("--------------------------------------------------------------------")
     # Only display per-class accuracy if display_per_class is True
     if display_per_class:
         print("\nPer-Class Accuracy:")
@@ -69,6 +68,7 @@ def evaluate_model(model, test_loader, criterion, classes, batch_size, epoch, nu
                 print(f'Class {i} ({classes[i]}): No samples')
                 print("\n")
 
+    print("--------------------------------------------------------------------")
     print(f'Epoch [{epoch + 1}/{num_epochs}], Test Loss: {test_loss:.6f}, Overall Accuracy: {overall_accuracy:.2f}%')
     print("--------------------------------------------------------------------")
 
@@ -185,34 +185,46 @@ for epoch in range(num_epochs):
             print('Epoch [%d/%d], Iter [%d/%d], Loss: %.6f' %
                   (epoch + 1, num_epochs, i + 1, total_batch, cost.item()))
 
+    # Step the scheduler
+    #scheduler.step()
+
     # Add evaluation after each epoch (without per-class accuracy)
     test_loss, test_accuracy = evaluate_model(
         model, test_loader, loss, testset.classes, batch_size, epoch, num_epochs, display_per_class=False
     )
 
-print("-------------------------------------------------")
+
 print("Final Evaluation of Locality-iN-Locality Model")
 # Final evaluation with per-class accuracy
 final_loss, final_accuracy = evaluate_model(
     model, test_loader, loss, testset.classes, batch_size, num_epochs - 1, num_epochs, display_per_class=True
 )
-print("-------------------------------------------------")
+
+torch.cuda.empty_cache()
 
 
-# Train LNL-MoEx
-from LNL_MoEx import LNL_MoEx_Ti as small
+# Train with Random Erasing
+from LNL_MoEx import LNL_MoEx_Ti as small  # Assuming this imports the modified TNT
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# Initialize model
 model = small(pretrained=False)
-model.head = torch.nn.Linear(in_features=192, out_features=43, bias=True)
+model.head = torch.nn.Linear(in_features=192, out_features=43, bias=True)  # 43 classes for GTSRB
 model = model.cuda()
 
+# Hyperparameters
 num_epochs = 100
-moex_lam = .9
-moex_prob = .7
+erase_prob = 0.5  # Probability of applying Random Erasing (replaces moex_prob)
+#batch_size = 50   # Adjust based on your train_loader setup
 
+# Loss and optimizer
 loss = nn.CrossEntropyLoss()
 optimizer = optim.SGD(model.parameters(), lr=0.007, momentum=0.9)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 
+# Assuming train_loader is defined elsewhere
 for epoch in range(num_epochs):
     total_batch = len(trainset) // batch_size
 
@@ -220,20 +232,17 @@ for epoch in range(num_epochs):
         input = input.cuda()
         target = target.cuda()
 
+        # Randomly decide whether to apply Random Erasing
         prob = torch.rand(1).item()
-        if prob < moex_prob:
-            swap_index = torch.randperm(input.size(0), device=input.device)
-            with torch.no_grad():
-                target_a = target
-                target_b = target[swap_index]
-            output = model(input, swap_index=swap_index, moex_norm='pono', moex_epsilon=1e-5,
-                           moex_layer='stem', moex_positive_only=False)
-            lam = moex_lam
-            cost = loss(output, target_a) * lam + loss(output, target_b) * (1. - lam)
+        if prob < erase_prob:
+            output = model(input, apply_erasing=True)  # Apply Random Erasing
         else:
-            output = model(input)
-            cost = loss(output, target)
+            output = model(input, apply_erasing=False)  # No augmentation
 
+        # Compute loss (no Mixup blending needed)
+        cost = loss(output, target)
+
+        # Backpropagation
         optimizer.zero_grad()
         cost.backward()
         optimizer.step()
@@ -242,20 +251,21 @@ for epoch in range(num_epochs):
             print('Epoch [%d/%d], Iter [%d/%d], Loss: %.6f' %
                   (epoch + 1, num_epochs, i + 1, total_batch, cost.item()))
 
+    # Step the scheduler
+    #scheduler.step()
+
     # Add evaluation after each epoch (without per-class accuracy)
     test_loss, test_accuracy = evaluate_model(
         model, test_loader, loss, testset.classes, batch_size, epoch, num_epochs, display_per_class=False
     )
 
 
-print("-------------------------------------------------")
 print("After applying MoEx")
 print("Final Evaluation of LNL-MoEx Model")
 # Final evaluation with per-class accuracy
 final_loss, final_accuracy = evaluate_model(
     model, test_loader, loss, testset.classes, batch_size, num_epochs - 1, num_epochs, display_per_class=True
 )
-print("-------------------------------------------------")
 
 # Model complexity
 with torch.cuda.device(0):
